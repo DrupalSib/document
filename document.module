@@ -1,0 +1,250 @@
+<?php
+
+/**
+ * @file
+ */
+
+define('DOCUMENT_REGISTER', 'documents');
+define('DOCUMENT_TRANSACTION_COMMIT', 'document_transaction_commit');
+define('DOCUMENT_TRANSACTION_ROLLBACK', 'document_transaction_rollback');
+
+function document_menu() {
+  return array(
+    'node/%node/movements' => array(
+      'title' => 'Movements',
+      'page callback' => 'document_node_movements_view',
+      //devel_load_object
+      'page arguments' => array(1),
+      'access callback' => 'node_access',
+      'access arguments' => array('view', 1),
+      'type' => MENU_LOCAL_TASK,
+      //'file' => 'devel.pages.inc',
+      'weight' => 100,
+    ),
+  );
+}
+
+function document_node_movements_view($node) {
+  $output = '';
+  foreach (document_get_types() as $type => $data) {
+    foreach ($data['registers'] as $name) {
+      $register = register_get($name);
+      if (get_class($register) == 'RegisterTypeMovement') {
+        $movements = $register->getMovements(array('rtp' => 'node', 'rid' => $node->nid));
+        $header = array();
+        $rows = array();
+        foreach($movements as $movement) {
+          if (!$header) {
+            $header = array_keys($movement);
+          }
+          $rows[] = $movement;
+        }
+        $output .= theme('table', $header, $rows, array(), ucfirst($name));
+      }
+    }
+  }
+  return $output;
+}
+
+function document_commit_submit($form, &$form_state) {
+  node_form_submit($form, $form_state);
+  $node = node_load($form_state['nid']);
+  document_commit($node);
+  drupal_set_message(t('@title has been committed.', array('@title' => $node->title)));
+}
+
+function document_rollback_submit($form, &$form_state) {
+  $node = node_load($form['#node']->nid);
+  document_rollback($node);
+  drupal_set_message(t('@title has been rollbacked.', array('@title' => $node->title)));
+}
+
+function document_form_alter(&$form, &$form_state, $form_id) {
+  $node = isset($form['#node']) ? $form['#node'] : NULL;
+  if ($node && $form_id == $node->type . '_node_form' && document_check_type($node)) {
+    $form['actions']['commit'] = array(
+      '#type' => 'submit',
+      '#access' => variable_get('node_preview_' . $node->type, DRUPAL_OPTIONAL) != DRUPAL_REQUIRED || (!form_get_errors() && isset($form_state['node_preview'])),
+      '#value' => t('Save & commit'),
+      '#weight' => 3,
+      '#submit' => array('document_commit_submit'),
+    );
+    if (isset($node->nid) && document_committed($node)) {
+      $form['actions']['rollback'] = array(
+        '#type' => 'submit',
+        '#access' => variable_get('node_preview_' . $node->type, DRUPAL_OPTIONAL) != DRUPAL_REQUIRED || (!form_get_errors() && isset($form_state['node_preview'])),
+        '#value' => t('Rollback'),
+        '#weight' => 4,
+        '#submit' => array('document_rollback_submit'),
+      );
+    }
+  }
+
+  switch ($form_id) {
+    case 'node_type_form':
+      $type = $form['#node_type']->type;
+      $registers = array();
+      foreach(register_get_all() as $name => $conf) {
+        if ($name != DOCUMENT_REGISTER) {
+          // @TODO Implement register title.
+          $registers[$name] = $name;
+        }
+      }
+      asort($registers);
+
+      $form['document'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Document settings'),
+        '#collapsible' => TRUE,
+        '#group' => 'additional_settings',
+
+        'node_document' => array(
+          '#type' => 'checkbox',
+          '#title' => t('Use as document'),
+          '#default_value' => variable_get('node_document_' . $type, FALSE),
+        ),
+
+        'node_document_register' => array(
+          '#type' => 'checkboxes',
+          '#title' => t('Allowed registers'),
+          '#options' => $registers,
+          '#default_value' => variable_get('node_document_reg_' . $type, array()),
+        ),
+      );
+      break;
+  }
+}
+
+function document_committed($node) {
+  $reg = register_get(DOCUMENT_REGISTER);
+  $value = $reg->getValue(array('nid' => $node->nid));
+  return isset($value['committed']) ? (bool) $value['committed'] : FALSE;
+}
+
+function document_get_types() {
+  $types = array();
+  foreach (node_type_get_types('names') as $type => $name) {
+    if (variable_get('node_document_' . $type, FALSE)) {
+      $types[$type] = array(
+        'type' => $type,
+        'name' => $name,
+        'registers' => variable_get('node_document_register_' . $type, array()),
+      );
+    }
+  }
+  return $types;
+}
+
+function document_check_type($node) {
+  $types = document_get_types();
+  return isset($types[$node->type]) ? TRUE : FALSE;
+}
+
+/**
+ * @param object $node
+ * @param string $name
+ * @return bool
+ */
+function document_check_register($node, $name) {
+  $result = FALSE;
+  $types = document_get_types();
+  if (isset($types[$node->type])) {
+    $result = array_search($name, $types[$node->type]['registers']) !== FALSE;
+  }
+  return $result;
+}
+
+function document_commit($node) {
+  if (document_check_type($node)) {
+    if (document_committed($node)) {
+      document_rollback($node);
+    }
+    $transaction = db_transaction(DOCUMENT_TRANSACTION_COMMIT);
+    try {
+      $hook = 'document_commit';
+      foreach (module_implements($hook) as $module) {
+        module_invoke($module, $hook, $node);
+      }
+
+      // Set "committed" flag for node.
+      $reg = register_get(DOCUMENT_REGISTER);
+      $reg->setValue(array('nid' => $node->nid, 'committed' => TRUE));
+    }
+    catch (Exception $e) {
+      $transaction->rollback();
+      throw $e;
+    }
+  }
+}
+
+function document_rollback($node) {
+  if (document_check_type($node)) {
+    $transaction = document_transaction(DOCUMENT_TRANSACTION_ROLLBACK);
+    try {
+      if (!document_committed($node)) {
+        throw new Exception('Document not committed');
+      }
+
+      $hook = 'document_rollback';
+      foreach (module_implements($hook) as $module) {
+        module_invoke($module, $hook, $node);
+      }
+
+      // Set "committed" flag for node.
+      $reg = register_get(DOCUMENT_REGISTER);
+      $reg->setValue(array('nid' => $node->nid, 'committed' => FALSE));
+    }
+    catch (Exception $e) {
+      $transaction->rollback();
+      throw $e;
+    }
+  }
+}
+
+function document_document_rollback($node) {
+  $types = document_get_types($node);
+  $regs = isset($types[$node->type]) ? $types[$node->type]['registers'] : array();
+  foreach ($regs as $name) {
+    $register = register_get($name);
+    if (get_class($register) == 'RegisterTypeMovement') {
+      $register->removeMovements(array('rtp' => 'node', 'rid' => $node->nid));
+    }
+  }
+}
+
+function document_get_register($name, $node) {
+  if ($name == DOCUMENT_REGISTER || !document_check_register($node, $name)) {
+    throw new Exception("Illegal register $name for node type $node->type");
+  }
+  return register_get($name);
+}
+
+function document_transaction($name = DOCUMENT_TRANSACTION_COMMIT) {
+  return db_transaction($name);
+}
+
+/**
+ * Implementats hook_ctools_plugin_api().
+ */
+function document_ctools_plugin_api($owner, $api) {
+  if ($owner == 'register' && $api == 'default_register_data') {
+    return array('version' => 1);
+  }
+}
+
+/**
+ * Implements hook_default_register_data().
+ */
+function document_default_register_data() {
+  $export = array();
+
+  $register = new stdClass();
+  $register->disabled = FALSE; /* Edit this to true to make a default register disabled initially */
+  $register->api_version = 1;
+  $register->register_name = 'documents';
+  $register->register_type = 'info';
+  $register->register_config = unserialize('a:3:{s:6:"fields";a:2:{s:3:"nid";a:7:{s:5:"title";s:3:"nid";s:5:"group";s:10:"dimensions";s:4:"type";s:3:"int";s:11:"size_preset";s:3:"big";s:8:"nullable";b:0;s:12:"default_type";s:4:"none";s:6:"weight";i:1;}s:9:"committed";a:7:{s:5:"title";s:9:"committed";s:5:"group";s:9:"resources";s:4:"type";s:3:"int";s:11:"size_preset";s:4:"tiny";s:8:"nullable";b:0;s:12:"default_type";s:4:"none";s:6:"weight";i:2;}}s:6:"groups";a:0:{}s:7:"options";a:0:{}}');
+  $export['documents'] = $register;
+
+  return $export;
+}

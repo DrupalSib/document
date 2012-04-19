@@ -1,0 +1,7 @@
+name = Document
+description = Allows to create documents
+dependencies[] = register
+core = 7.x
+package = Accounting suite
+
+
